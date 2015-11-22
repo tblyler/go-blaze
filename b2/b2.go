@@ -9,7 +9,8 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
-	"time"
+	"strconv"
+	"strings"
 )
 
 // APIurl base address for the B2 API
@@ -21,53 +22,19 @@ const APIsuffix = "/b2api/v1"
 // GoodStatus status code for a successful API call
 const GoodStatus = 200
 
+// HeaderInfoPrefix the prefix for file header info
+const HeaderInfoPrefix = "X-Bz-Info-"
+
 // ErrGeneric generic error from API
 var ErrGeneric = errors.New("Received invalid response from B2 API")
 
 // B2 communicates to B2 API and holds information for the connection
 type B2 struct {
-	AccountID   string  `json:"accountId"`
-	APIUrl      string  `json:"apiUrl"`
-	AuthToken   string  `json:"authorizationToken"`
-	DownloadURL string  `json:"downloadUrl"`
-	AppKey      string  `json:"-"`
-	Upload      *Upload `json:"-"`
-}
-
-// Upload B2 upload information
-type Upload struct {
-	BucketID  string `json:"bucketId"`
-	UploadURL string `json:"uploadUrl"`
-	AuthToken string `json:"authorizationToken"`
-}
-
-// Bucket B2 bucket type
-type Bucket struct {
-	AccountID string `json:"accountId"`
-	ID        string `json:"bucketId"`
-	Name      string `json:"bucketName"`
-	Type      string `json:"bucketType"`
-}
-
-// FileInfo B2 file information
-type FileInfo struct {
-	AccountID string            `json:"accountId"`
-	ID        string            `json:"fileId"`
-	Name      string            `json:"fileName"`
-	BucketID  string            `json:"bucketId"`
-	Length    int64             `json:"contentLength"`
-	Sha1      string            `json:"contentSha1"`
-	Type      string            `json:"contentType"`
-	Info      map[string]string `json:"fileInfo"`
-}
-
-// FileName B2 file name
-type FileName struct {
-	ID        string `json:"fileId"`
-	Name      string `json:"fileName"`
-	Action    string `json:"action"`
-	Size      int64  `json:"size"`
-	Timestamp int64  `json:"uploadTimestamp"`
+	AccountID   string `json:"accountId"`
+	APIUrl      string `json:"apiUrl"`
+	AuthToken   string `json:"authorizationToken"`
+	DownloadURL string `json:"downloadUrl"`
+	AppKey      string `json:"-"`
 }
 
 // Err B2 error information
@@ -81,6 +48,7 @@ func (b *Err) Error() string {
 	return fmt.Sprintf("code: '%s' status: '%d' message: '%s'", b.Code, b.Status, b.Message)
 }
 
+// readResp take an http response from the B2 API and unmarshal it to the appropriate type
 func readResp(resp *http.Response, output interface{}) error {
 	data, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
@@ -96,6 +64,7 @@ func readResp(resp *http.Response, output interface{}) error {
 		return nil
 	}
 
+	// errors are generated anytime there is not a status code of GoodStatus
 	errb2 := &Err{}
 	err = json.Unmarshal(data, errb2)
 	if err != nil {
@@ -103,6 +72,34 @@ func readResp(resp *http.Response, output interface{}) error {
 	}
 
 	return errb2
+}
+
+func (b *B2) readHeaderFileInfo(header http.Header) (*FileInfo, error) {
+	var err error
+	info := &FileInfo{conn: b}
+	info.AccountID = b.AccountID
+	info.Type = header.Get("Content-Type")
+	info.ID = header.Get("X-Bz-File-Id")
+	info.Length, err = strconv.ParseInt(header.Get("Content-Length"), 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	info.Name, err = url.QueryUnescape(header.Get("X-Bz-File-Name"))
+	if err != nil {
+		return nil, err
+	}
+	info.Sha1 = header.Get("X-Bz-Content-Sha1")
+
+	for headerName, val := range header {
+		if !strings.HasPrefix(headerName, HeaderInfoPrefix) {
+			continue
+		}
+
+		// B2 does not support multiple values per header
+		info.Info[headerName[len(HeaderInfoPrefix):]] = val[0]
+	}
+
+	return info, nil
 }
 
 // NewB2 create a new B2 API handler
@@ -147,7 +144,7 @@ func (b *B2) CreateBucket(bucketName string, bucketType string) (*Bucket, error)
 		return nil, err
 	}
 
-	bucket := &Bucket{}
+	bucket := &Bucket{conn: b}
 	err = readResp(resp, bucket)
 	if err != nil {
 		return nil, err
@@ -178,7 +175,7 @@ func (b *B2) DeleteBucket(bucketID string) (*Bucket, error) {
 		return nil, err
 	}
 
-	bucket := &Bucket{}
+	bucket := &Bucket{conn: b}
 
 	err = readResp(resp, bucket)
 	if err != nil {
@@ -218,60 +215,8 @@ func (b *B2) GetUploadURL(bucketID string) (*Upload, error) {
 	return upload, nil
 }
 
-// UploadFile uploads one file to B2
-func (b *B2) UploadFile(data io.Reader, fileName string, fileSize int64, contentType string, sha1 string, mtime *time.Time, info map[string]string) (*FileInfo, error) {
-	if b.Upload == nil {
-		return nil, errors.New("Must run GetUploadURL and set B2.Upload to upload")
-	}
-
-	req, err := http.NewRequest("POST", b.Upload.UploadURL, data)
-	if err != nil {
-		return nil, err
-	}
-
-	req.ContentLength = fileSize
-
-	if contentType == "" {
-		contentType = "b2/x-auto"
-	}
-
-	fileEncoded, err := url.Parse(fileName)
-	if err != nil {
-		return nil, err
-	}
-
-	fileName = fileEncoded.String()
-
-	req.Header.Add("Authorization", b.Upload.AuthToken)
-	req.Header.Add("X-Bz-File-Name", fileName)
-	req.Header.Add("Content-Type", contentType)
-	req.Header.Add("X-Bz-Content-Sha1", sha1)
-	if mtime != nil {
-		req.Header.Add("X-Bz-Info-src_last_modified_millis", fmt.Sprint(mtime.UnixNano()/1000000))
-	}
-
-	if info != nil {
-		for name, value := range info {
-			req.Header.Add("X-Bz-Info-"+name, value)
-		}
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	fileInfo := &FileInfo{}
-	err = readResp(resp, fileInfo)
-	if err != nil {
-		return nil, err
-	}
-
-	return fileInfo, nil
-}
-
 // DownloadFileByID Downloads one file from B2
-func (b *B2) DownloadFileByID(fileID string, output io.Writer) (http.Header, error) {
+func (b *B2) DownloadFileByID(fileID string, output io.Writer) (*FileInfo, error) {
 	req, err := http.NewRequest("GET", b.DownloadURL+APIsuffix+"/b2_download_file_by_id", nil)
 	if err != nil {
 		return nil, err
@@ -299,11 +244,11 @@ func (b *B2) DownloadFileByID(fileID string, output io.Writer) (http.Header, err
 		return nil, err
 	}
 
-	return resp.Header, nil
+	return b.readHeaderFileInfo(resp.Header)
 }
 
 // DownloadFileByName downloads one file by providing the name of the bucket and the name of the file
-func (b *B2) DownloadFileByName(bucketName string, fileName string, output io.Writer) (http.Header, error) {
+func (b *B2) DownloadFileByName(bucketName string, fileName string, output io.Writer) (*FileInfo, error) {
 	urlFileName, err := url.Parse(fileName)
 	if err != nil {
 		return nil, err
@@ -332,7 +277,7 @@ func (b *B2) DownloadFileByName(bucketName string, fileName string, output io.Wr
 		return nil, err
 	}
 
-	return resp.Header, nil
+	return b.readHeaderFileInfo(resp.Header)
 }
 
 // UpdateBucket update an existing bucket
@@ -358,7 +303,7 @@ func (b *B2) UpdateBucket(bucketID string, bucketType string) (*Bucket, error) {
 		return nil, err
 	}
 
-	bucket := &Bucket{}
+	bucket := &Bucket{conn: b}
 	err = readResp(resp, bucket)
 	if err != nil {
 		return nil, err
@@ -389,7 +334,7 @@ func (b *B2) DeleteFileVersion(fileName string, fileID string) (*FileInfo, error
 		return nil, err
 	}
 
-	fileInfo := &FileInfo{}
+	fileInfo := &FileInfo{conn: b}
 	err = readResp(resp, fileInfo)
 	if err != nil {
 		return nil, err
@@ -427,10 +372,14 @@ func (b *B2) ListBuckets() ([]Bucket, error) {
 		return nil, err
 	}
 
+	for i := range buckets.Buckets {
+		buckets.Buckets[i].conn = b
+	}
+
 	return buckets.Buckets, nil
 }
 
-// ListFileNames Lists the names of all files in a bucket, starting at a given name<Paste>
+// ListFileNames Lists the names of all files in a bucket, starting at a given name
 func (b *B2) ListFileNames(bucketID string, startFileName string, maxFileCount int) ([]FileName, string, error) {
 	data, err := json.Marshal(struct {
 		BucketID      string `json:"bucketId"`
@@ -463,6 +412,10 @@ func (b *B2) ListFileNames(bucketID string, startFileName string, maxFileCount i
 	err = readResp(resp, list)
 	if err != nil {
 		return nil, "", err
+	}
+
+	for i := range list.Files {
+		list.Files[i].conn = b
 	}
 
 	return list.Files, list.NextFileName, nil
@@ -506,6 +459,10 @@ func (b *B2) ListFileVersions(bucketID string, startFileName string, startFileID
 		return nil, "", "", err
 	}
 
+	for i := range list.Files {
+		list.Files[i].conn = b
+	}
+
 	return list.Files, list.NextFileID, list.NextFileName, nil
 }
 
@@ -529,7 +486,7 @@ func (b *B2) GetFileInfo(fileID string) (*FileInfo, error) {
 		return nil, err
 	}
 
-	info := &FileInfo{}
+	info := &FileInfo{conn: b}
 	err = readResp(resp, info)
 	if err != nil {
 		return nil, err
@@ -559,7 +516,7 @@ func (b *B2) HideFile(bucketID string, fileName string) (*FileName, error) {
 		return nil, err
 	}
 
-	info := &FileName{}
+	info := &FileName{conn: b}
 	err = readResp(resp, info)
 	if err != nil {
 		return nil, err
